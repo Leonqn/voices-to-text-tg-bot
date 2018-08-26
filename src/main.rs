@@ -2,87 +2,126 @@ extern crate voices_to_text;
 extern crate serde;
 extern crate serde_json;
 #[macro_use]
-extern crate serde_derive;extern crate tokio;
+extern crate serde_derive;
 extern crate hyper;
 extern crate hyper_tls;
 extern crate base64;
-extern crate futures;
-#[macro_use] extern crate log;
-extern crate env_logger;
+#[macro_use]
+extern crate log;
+extern crate pretty_env_logger;
 extern crate config;
-
+extern crate relegram;
 
 use hyper::rt::Future;
-use voices_to_text::telegram::bot_client::BotClient;
 use hyper::Client;
 use hyper_tls::HttpsConnector;
 use std::sync::Arc;
 use hyper::Body;
-use voices_to_text::google::speech_client::SpeechClient;
 use base64::encode;
-use voices_to_text::google::requests::*;
 use hyper::rt::Stream;
-use voices_to_text::telegram::requests::*;
 use config::Config;
+use relegram::requests::*;
+use relegram::responses::*;
+use relegram::{HttpClient, BotApiClient};
+use std::time::Duration;
+use voices_to_text::google::*;
 
 #[derive(Deserialize, Debug)]
 pub struct Settings {
     pub bot_apikey: String,
-    pub google_apikey: String,
-    pub lang: String
+    pub speech_apikey: String,
+    pub lang: String,
 }
 
 fn main() {
-    env_logger::init();
+    pretty_env_logger::init();
+    info!("Started");
+
     let mut settings = Config::default();
     settings
-        .merge(config::File::with_name("settings.json").required(false))
-        .and_then(|x| x.merge(config::Environment::with_prefix("VTT")))
+        .merge(config::Environment::new())
         .expect("can't find settings");
 
-    let config: Settings = settings.try_into().expect("Wrong config");
+    let Settings { bot_apikey, speech_apikey, lang }: Settings = settings.try_into().expect("Wrong settings");
 
     let https = HttpsConnector::new(1).expect("TLS initialization failed");
-    let client = Arc::new(Client::builder().build::<_, Body>(https));
-    let bot_client = Arc::new(BotClient::new(Arc::clone(&client), config.bot_apikey));
-    let speech_client = Arc::new(SpeechClient::new(Arc::clone(&client), config.google_apikey));
-    let lang = config.lang;
-    let tg =
-        BotClient::incoming_voice_messages(Arc::clone(&bot_client))
-            .map_err(|err| error!("{:?}", err))
-            .for_each(move |message| {
-                let file_id = message.voice.unwrap().file_id.clone();
-                let chat_id = message.chat.unwrap().id;
-                let reply_to = message.message_id;
-                let get_file = GetFile {
-                    file_id
-                };
-                let lang = lang.clone();
-                let speech_arc = Arc::clone(&speech_client);
-                let bot_client_arc = Arc::clone(&bot_client);
-                let fut = bot_client_arc.get_file(get_file)
-                    .and_then(move |audio| {
-                        let b64_audio = encode(&audio);
-                        speech_arc.recognize(RecognizeRequest {
-                            config: RecognitionConfig {
-                                encoding: AudioEncoding::OggOpus,
-                                sample_rate_hertz: 16000,
-                                language_code: lang,
-                            },
-                            audio: RecognitionAudio { content: b64_audio },
-                        }).and_then(move |recognized| {
-                            bot_client_arc.send_message(SendMessage {
-                                chat_id,
-                                text: recognized.results.into_iter().nth(0).and_then(|x| x.alternatives.into_iter().nth(0).map(|x| x.transcript)).unwrap_or(String::from("Cant recognize")),
-                                reply_to_message_id: Some(reply_to),
-                            })
-                        })
-                    })
-                    .map(|_| ())
-                    .map_err(|err| error!("{:?}", err));
-                hyper::rt::spawn(fut);
-                Ok(())
+    let http_client = Arc::new(Client::builder().build::<_, Body>(https));
+    let bot_client = Arc::new(BotApiClient::new(HttpClient::Arc(Arc::clone(&http_client)), bot_apikey));
+    let speech_client = Arc::new(SpeechClient::new(Arc::clone(&http_client), speech_apikey));
+    let default_timeout = Duration::from_secs(10);
+    let get_updates = GetUpdatesRequest {
+        offset: None,
+        limit: None,
+        timeout: Some(30),
+        allowed_updates: None,
+    };
+    let fut =
+        bot_client.incoming_updates(get_updates)
+            .then(Ok)
+            .for_each(move |update| {
+                match update {
+                    Ok(update) => {
+                        match update.kind {
+                            UpdateKind::Message(Message { id, from: MessageFrom::User { chat, .. }, kind: MessageKind::Voice { voice, .. }, .. }) => {
+                                let speech_client = Arc::clone(&speech_client);
+                                let lang = lang.clone();
+                                let bot_client = Arc::clone(&bot_client);
+                                let send_recognized_fut =
+                                    bot_client
+                                        .download_file(&GetFileRequest { file_id: voice.file_id }, default_timeout)
+                                        .map_err(|x| error!("Error occurred while downloading voice {:?}", x))
+                                        .and_then(|voice| recognize(speech_client, voice, lang))
+                                        .and_then(move |recognized|
+                                            bot_client
+                                                .send_message(&SendMessageRequest {
+                                                    chat_id: ChatId::Id(chat.id),
+                                                    kind: SendMessageKind::Text(SendText::new(recognized)),
+                                                    disable_notification: false,
+                                                    reply_to_message_id: Some(id),
+                                                    reply_markup: None,
+                                                }, default_timeout)
+                                                .map_err(|x| error!("Error occurred while sending recognized response {:?}", x)))
+                                        .map(|_| ());
+                                hyper::rt::spawn(send_recognized_fut);
+                                Ok(())
+                            }
+                            _ =>
+                                Ok(())
+                        }
+                    }
+                    Err(e) => {
+                        error!("An error has occurred while receiving update {:?}", e);
+                        Ok(())
+                    }
+                }
             });
+    hyper::rt::run(fut);
+}
 
-    hyper::rt::run(tg);
+fn recognize(speech_client: Arc<SpeechClient>, voice: Vec<u8>, lang: String) -> impl Future<Item=String, Error=()> {
+    let encoded_voice = encode(&voice);
+    speech_client.recognize(RecognizeRequest {
+        config: RecognitionConfig {
+            encoding: AudioEncoding::OggOpus,
+            sample_rate_hertz: 16000,
+            language_code: lang,
+        },
+        audio: RecognitionAudio { content: encoded_voice },
+    }).then(|recognition_result| {
+        match recognition_result {
+            Ok(recognition_result) =>
+                Ok(recognition_result
+                    .results
+                    .and_then(|results| results
+                        .into_iter()
+                        .nth(0)
+                        .and_then(|x| x.alternatives.into_iter().nth(0).map(|x| x.transcript)))
+                    .unwrap_or(String::from("Got empty result from speech api"))),
+            Err(e) => {
+                let error_msg = format!("Error response from google {:?}", e);
+                error!("{}", error_msg);
+                Ok(error_msg)
+            }
+        }
+    })
 }

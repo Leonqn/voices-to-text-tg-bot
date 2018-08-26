@@ -5,8 +5,6 @@ use serde_json;
 pub enum Error {
     Http(hyper::Error),
     Serialization(serde_json::Error),
-    Telegram(hyper::StatusCode, Option<String>),
-    UnknownError(String)
 }
 
 impl From<hyper::Error> for Error {

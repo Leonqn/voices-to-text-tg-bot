@@ -1,6 +1,6 @@
 #[derive(Deserialize, Debug)]
 pub struct SpeechRecognitionResponse {
-    pub results: Vec<SpeechRecognitionResult>
+    pub results: Option<Vec<SpeechRecognitionResult>>
 }
 
 #[derive(Deserialize, Debug)]

@@ -25,6 +25,8 @@ use relegram::responses::*;
 use relegram::{HttpClient, BotApiClient};
 use std::time::Duration;
 use voices_to_text::google::*;
+use std::process::{Command};
+use std::io::{Read, Write};
 
 #[derive(Deserialize, Debug)]
 pub struct Settings {
@@ -55,6 +57,7 @@ fn main() {
         timeout: Some(30),
         allowed_updates: None,
     };
+
     let fut =
         bot_client.incoming_updates(get_updates)
             .then(Ok)
@@ -62,35 +65,62 @@ fn main() {
                 match update {
                     Ok(update) => {
                         match update.kind {
-                            UpdateKind::Message(Message { id, from: MessageFrom::User { chat, .. }, kind: MessageKind::Voice { voice, .. }, .. }) => {
+                            UpdateKind::Message(Message { id, from: MessageFrom::User { chat, .. }, kind, .. }) => {
                                 let speech_client = Arc::clone(&speech_client);
                                 let lang = lang.clone();
-                                let bot_client = Arc::clone(&bot_client);
-                                let send_recognized_fut =
-                                    bot_client
-                                        .download_file(&GetFileRequest { file_id: voice.file_id }, default_timeout)
-                                        .map_err(|x| error!("Error occurred while downloading voice {:?}", x))
-                                        .and_then(|voice| recognize(speech_client, voice, lang))
-                                        .and_then(move |recognized|
-                                            bot_client
-                                                .send_message(&SendMessageRequest {
-                                                    chat_id: ChatId::Id(chat.id),
-                                                    kind: SendMessageKind::Text(SendText::new(recognized)),
-                                                    disable_notification: false,
-                                                    reply_to_message_id: Some(id),
-                                                    reply_markup: None,
-                                                }, default_timeout)
-                                                .map_err(|x| error!("Error occurred while sending recognized response {:?}", x)))
-                                        .map(|_| ());
-                                hyper::rt::spawn(send_recognized_fut);
-                                Ok(())
+                                let bot_client_arc = Arc::clone(&bot_client);
+
+                                let download = move |file_id| {
+                                    bot_client_arc
+                                        .download_file(&GetFileRequest { file_id }, default_timeout)
+                                        .map_err(|x| error!("Error occurred while downloading file {:?}", x))
+                                };
+                                let recognize = move |voice, encoding| {
+                                    recognize(speech_client, voice, lang, encoding)
+                                };
+                                let bot_client_arc = Arc::clone(&bot_client);
+                                let resend = move |recognized| {
+                                    bot_client_arc
+                                        .send_message(&SendMessageRequest {
+                                            chat_id: ChatId::Id(chat.id),
+                                            kind: SendMessageKind::Text(SendText::new(recognized)),
+                                            disable_notification: false,
+                                            reply_to_message_id: Some(id),
+                                            reply_markup: None,
+                                        }, default_timeout)
+                                        .map_err(|x| error!("Error occurred while sending recognized response {:?}", x))
+                                        .map(|_| ())
+                                };
+
+                                let video_to_audio = |mut video: Vec<u8>| {
+                                    video_note_to_audio(&mut video).map_err(|x| error!("Error occured while converting video to audio {:?}", x))
+                                };
+
+                                match kind {
+                                    MessageKind::Voice { voice, .. } => {
+                                            download(voice.file_id)
+                                                .and_then(|x| recognize(x, AudioEncoding::OggOpus))
+                                                .and_then(resend)
+                                                .wait()
+                                    }
+                                    MessageKind::VideoNote { video_note, .. } => {
+                                            download(video_note.file_id)
+                                                .and_then(video_to_audio)
+                                                .and_then(|x| recognize(x, AudioEncoding::Flac))
+                                                .and_then(resend)
+                                                .wait()
+                                    }
+
+                                    _ =>
+                                        Ok(())
+                                }
                             }
                             _ =>
                                 Ok(())
                         }
                     }
                     Err(e) => {
-                        error!("An error has occurred while receiving update {:?}", e);
+                        error!("Error has occurred while receiving update {:?}", e);
                         Ok(())
                     }
                 }
@@ -98,11 +128,24 @@ fn main() {
     hyper::rt::run(fut);
 }
 
-fn recognize(speech_client: Arc<SpeechClient>, voice: Vec<u8>, lang: String) -> impl Future<Item=String, Error=()> {
+fn video_note_to_audio(video_note: &mut [u8]) -> Result<Vec<u8>, std::io::Error> {
+    std::fs::File::create("video_note.mp4")
+        ?.write_all(video_note)?;
+    Command::new("avconv")
+        .args(&["-i", "video_note.mp4", "-vn", "-acodec", "flac", "-ar", "16000", "-y", "voice.flac"])
+        .spawn()?
+        .wait()?;
+    let mut result = Vec::new();
+    std::fs::File::open("voice.flac")?
+        .read_to_end(&mut result)?;
+    Ok(result)
+}
+
+fn recognize(speech_client: Arc<SpeechClient>, voice: Vec<u8>, lang: String, encoding: AudioEncoding) -> impl Future<Item=String, Error=()> {
     let encoded_voice = encode(&voice);
     speech_client.recognize(RecognizeRequest {
         config: RecognitionConfig {
-            encoding: AudioEncoding::OggOpus,
+            encoding: encoding,
             sample_rate_hertz: 16000,
             language_code: lang,
         },

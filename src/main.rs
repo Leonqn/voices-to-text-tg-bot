@@ -93,7 +93,7 @@ fn main() {
                                 };
 
                                 let video_to_audio = |mut video: Vec<u8>| {
-                                    video_note_to_audio(&mut video).map_err(|x| error!("Error occured while converting video to audio {:?}", x))
+                                    video_note_to_audio(&mut video).map_err(|x| error!("Error occurred while converting video to audio {:?}", x))
                                 };
 
                                 match kind {
@@ -101,6 +101,7 @@ fn main() {
                                             download(voice.file_id)
                                                 .and_then(|x| recognize(x, AudioEncoding::OggOpus))
                                                 .and_then(resend)
+                                                .then(|x| match x {Err(_) => Ok(()), Ok(_) => Ok(())})
                                                 .wait()
                                     }
                                     MessageKind::VideoNote { video_note, .. } => {
@@ -108,6 +109,7 @@ fn main() {
                                                 .and_then(video_to_audio)
                                                 .and_then(|x| recognize(x, AudioEncoding::Flac))
                                                 .and_then(resend)
+                                                .then(|x| match x {Err(_) => Ok(()), Ok(_) => Ok(())})
                                                 .wait()
                                     }
 
